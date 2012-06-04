@@ -52,6 +52,7 @@
 		{ if( $GLOBALS['pg4wp_conn']) return pg_last_error(); else return ''; }
 	function wpsql_fetch_assoc($result) { return pg_fetch_assoc($result); }
 	function wpsql_escape_string($s) { return pg_escape_string($s); }
+	function wpsql_real_escape_string($s,$c) { return pg_escape_string($s); }
 	function wpsql_get_server_info() { return '5.0.30'; } // Just want to fool wordpress ...
 	function wpsql_result($result, $i, $fieldname)
 		{ return pg_fetch_result($result, $i, $fieldname); }
@@ -60,8 +61,11 @@
 	function wpsql_connect($dbserver, $dbuser, $dbpass)
 	{
 		$GLOBALS['pg4wp_connstr'] = '';
-		if( !empty( $dbserver))
-			$GLOBALS['pg4wp_connstr'] .= ' host='.$dbserver;
+		list($host, $port) = explode(':', $dbserver);
+		if( !empty( $host))
+			$GLOBALS['pg4wp_connstr'] .= ' host='.$host;
+		if( !empty( $port))
+			$GLOBALS['pg4wp_connstr'] .= ' port='.$port;
 		if( !empty( $dbuser))
 			$GLOBALS['pg4wp_connstr'] .= ' user='.$dbuser;
 		if( !empty( $dbpass))
@@ -122,13 +126,21 @@
 			return true;
 		}
 		
+		$initial = $sql;
 		$sql = pg4wp_rewrite( $sql);
 		
 		$GLOBALS['pg4wp_result'] = pg_query($sql);
 		if( (PG4WP_DEBUG || PG4WP_LOG_ERRORS) && $GLOBALS['pg4wp_result'] === false && $err = pg_last_error())
-			if( false === strpos($err, 'relation "'.$wpdb->options.'"'))
-				error_log("Error running :\n$initial\n---- converted to ----\n$sql\n----\n$err\n---------------------\n", 3, PG4WP_LOG.'pg4wp_errors.log');
-		
+		{
+			$ignore = false;
+			if( defined('WP_INSTALLING') && WP_INSTALLING)
+			{
+				global $table_prefix;
+				$ignore = strpos($err, 'relation "'.$table_prefix);
+			}
+			if( ! $ignore )
+				error_log('['.microtime(true)."] Error running :\n$initial\n---- converted to ----\n$sql\n----> $err\n---------------------\n", 3, PG4WP_LOG.'pg4wp_errors.log');
+		}
 		return $GLOBALS['pg4wp_result'];
 	}
 	
@@ -151,7 +163,7 @@
 		$res = pg_query($sql);
 		$data = pg_fetch_result($res, 0, 0);
 		if( PG4WP_DEBUG && $sql)
-			error_log("Getting inserted ID for '$t' : $sql => $data\n", 3, PG4WP_LOG.'pg4wp_insertid.log');
+			error_log( '['.microtime(true)."] Getting inserted ID for '$t' : $sql => $data\n", 3, PG4WP_LOG.'pg4wp_insertid.log');
 		return $data;
 	}
 	
@@ -175,7 +187,7 @@
 				$sql = str_replace('SQL_CALC_FOUND_ROWS', '', $sql);
 				$GLOBALS['pg4wp_numrows_query'] = $sql;
 				if( PG4WP_DEBUG)
-					error_log( "Number of rows required for :\n$sql\n---------------------\n", 3, PG4WP_LOG.'pg4wp_NUMROWS.log');
+					error_log( '['.microtime(true)."] Number of rows required for :\n$sql\n---------------------\n", 3, PG4WP_LOG.'pg4wp_NUMROWS.log');
 			}
 			elseif( false !== strpos($sql, 'FOUND_ROWS()'))
 			{
@@ -189,8 +201,11 @@
 				$sql = preg_replace( $pattern, 'SELECT COUNT($1) $2', $sql);
 			}
 			
+			// Handle CAST( ... AS CHAR)
+			$sql = preg_replace( '/CAST\((.+) AS CHAR\)/', 'CAST($1 AS TEXT)', $sql);
+			
 			// Handle COUNT(*)...ORDER BY...
-			$sql = preg_replace( '/COUNT(.+)ORDER BY.+/', 'COUNT$1', $sql);
+			$sql = preg_replace( '/COUNT(.+)ORDER BY.+/s', 'COUNT$1', $sql);
 			
 			// In order for users counting to work...
 			$matches = array();
@@ -313,6 +328,11 @@
 			// This will avoid modifications to anything following ' VALUES'
 			list($sql,$end) = explode( ' VALUES', $sql, 2);
 			$end = ' VALUES'.$end;
+			
+			// When installing, the sequence for table terms has to be updated
+			if( defined('WP_INSTALLING') && WP_INSTALLING && false !== strpos($sql, 'INSERT INTO `'.$wpdb->terms.'`'))
+				$end .= ';SELECT setval(\''.$wpdb->terms.'_seq\', (SELECT MAX(term_id) FROM '.$wpdb->terms.')+1);';
+			
 		} // INSERT
 		elseif( 0 === strpos( $sql, 'DELETE' ))
 		{
@@ -345,14 +365,14 @@
 			$sql = str_replace( 'OPTIMIZE TABLE', 'VACUUM', $sql);
 		}
 		// Handle 'SET NAMES ... COLLATE ...'
-		elseif( false !== strpos($sql, 'COLLATE'))
+		elseif( 0 === strpos($sql, 'SET NAMES') && false !== strpos($sql, 'COLLATE'))
 		{
 			$logto = 'SETNAMES';
 			$sql = "SET NAMES 'utf8'";
 		}
 		// Load up upgrade and install functions as required
 		$begin = substr( $sql, 0, 3);
-		$search = array( 'SHO', 'ALT', 'DES', 'CRE');
+		$search = array( 'SHO', 'ALT', 'DES', 'CRE', 'DRO');
 		if( in_array($begin, $search))
 		{
 			require_once( PG4WP_ROOT.'/driver_pgsql_install.php');
@@ -383,7 +403,7 @@
 				$sql = preg_replace($pattern, '( ID', $sql);
 			$pattern = '/,ID/';
 				$sql = preg_replace($pattern, ', ID', $sql);
-			$pattern = '/[a-zA-Z_]+ID/';
+			$pattern = '/[0-9a-zA-Z_]+ID/';
 				$sql = preg_replace($pattern, '"$0"', $sql);
 			$pattern = '/\.ID/';
 				$sql = preg_replace($pattern, '."ID"', $sql);
@@ -416,12 +436,16 @@
 		// Put back the end of the query if it was separated
 		$sql .= $end;
 		
+		// Correct quoting for PostgreSQL 9.1+ compatibility
+		$sql = str_replace( "\\'", "''", $sql);
+		$sql = str_replace( '\"', '"', $sql);
+		
 		if( PG4WP_DEBUG)
 		{
 			if( $initial != $sql)
-				error_log("Converting :\n$initial\n---- to ----\n$sql\n---------------------\n", 3, PG4WP_LOG.'pg4wp_'.$logto.'.log');
+				error_log( '['.microtime(true)."] Converting :\n$initial\n---- to ----\n$sql\n---------------------\n", 3, PG4WP_LOG.'pg4wp_'.$logto.'.log');
 			else
-				error_log("$sql\n---------------------\n", 3, PG4WP_LOG.'pg4wp_unmodified.log');
+				error_log( '['.microtime(true)."] $sql\n---------------------\n", 3, PG4WP_LOG.'pg4wp_unmodified.log');
 		}
 		return $sql;
 	}
